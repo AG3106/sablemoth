@@ -69,9 +69,58 @@ impl DateTable {
 
 static TABLE: std::sync::OnceLock<DateTable> = std::sync::OnceLock::new();
 
-/// Install the fast date table (call once, before parsing).
+/// The few calendar months around the window: the 8-byte prefix `YYYY-MM-`
+/// as a little-endian u64, the day number of the 1st, and the month length.
+struct Months {
+    n: usize,
+    prefix: [u64; 8],
+    base: [i64; 8],
+    dim: [u8; 8],
+}
+
+static MONTHS: std::sync::OnceLock<Months> = std::sync::OnceLock::new();
+
+/// Install the fast date tables (call once, before parsing).
 pub fn init_dates(from_day: i64, to_day: i64) {
-    let _ = TABLE.set(DateTable::new(from_day, to_day));
+    let t = DateTable::new(from_day, to_day);
+    let mut m = Months { n: 0, prefix: [0; 8], base: [0; 8], dim: [0; 8] };
+    for day in from_day..=to_day {
+        let k = t.days.iter().position(|&d| d as i64 == day).unwrap() as i64 + t.first_key;
+        let (y, mo) = (k / 32 / 16, k / 32 % 16);
+        let text = format!("{y:04}-{mo:02}-");
+        let pre = u64::from_le_bytes(text.as_bytes().try_into().unwrap());
+        if m.prefix[..m.n].contains(&pre) || m.n == 8 {
+            continue;
+        }
+        let dim = match mo {
+            2 => if leap(y) { 29 } else { 28 },
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        m.prefix[m.n] = pre;
+        m.base[m.n] = days_from_civil(y, mo, 1);
+        m.dim[m.n] = dim;
+        m.n += 1;
+    }
+    let _ = MONTHS.set(m);
+    let _ = TABLE.set(t);
+}
+
+/// `HH:MM:SS` at v[0..8] -> seconds of day, validated.
+#[inline(always)]
+fn hms(v: &[u8]) -> Option<i64> {
+    let x = u64::from_le_bytes(v[..8].try_into().unwrap());
+    let t = x ^ 0x3030_3a30_303a_3030; // "00:00:00"
+    // every byte must be < 10 (digits) and the two colon bytes exactly 0
+    if ((t.wrapping_add(0x7676_7676_7676_7676) | t) & 0x8080_8080_8080_8080) != 0 || (t & 0x0000_ff00_00ff_0000) != 0 {
+        return None;
+    }
+    let b = t.to_le_bytes();
+    let (h, m, s) = (b[0] as i64 * 10 + b[1] as i64, b[3] as i64 * 10 + b[4] as i64, b[6] as i64 * 10 + b[7] as i64);
+    if h > 23 || m > 59 || s > 59 {
+        return None;
+    }
+    Some(h * 3600 + m * 60 + s)
 }
 
 #[inline(always)]
@@ -113,6 +162,32 @@ fn slow_days(year: i64, month: i64, day: i64) -> Option<i64> {
 /// The UTC (or local, for F2) instant of the first 19 bytes, validated.
 #[inline]
 fn civil_ms(v: &[u8]) -> Option<i64> {
+    if let Some(m) = MONTHS.get() {
+        let pre = u64::from_le_bytes(v[..8].try_into().unwrap());
+        for k in 0..m.n {
+            if m.prefix[k] == pre {
+                if v[10] != b'T' {
+                    return None;
+                }
+                let a = v[8].wrapping_sub(b'0');
+                let b = v[9].wrapping_sub(b'0');
+                if a >= 10 || b >= 10 {
+                    return None;
+                }
+                let day = (a * 10 + b) as i64;
+                if day < 1 || day > m.dim[k] as i64 {
+                    return None;
+                }
+                let secs = hms(&v[11..19])?;
+                return Some((m.base[k] + day - 1) * DAY + secs * SECOND);
+            }
+        }
+    }
+    civil_ms_slow(v)
+}
+
+#[cold]
+fn civil_ms_slow(v: &[u8]) -> Option<i64> {
     if v[4] != b'-' || v[7] != b'-' || v[10] != b'T' || v[13] != b':' || v[16] != b':' {
         return None;
     }
@@ -204,6 +279,33 @@ mod tests {
                         assert_eq!(fast, slow, "{y}-{m}-{d}");
                     }
                 }
+            }
+        }
+    }
+    #[test]
+    fn hms_exact() {
+        for h in 0..30 { for m in 0..65 { for s in [0, 1, 59, 60, 61, 99] {
+            let txt = format!("{h:02}:{m:02}:{s:02}");
+            let want = if h < 24 && m < 60 && s < 60 { Some(h * 3600 + m * 60 + s) } else { None };
+            assert_eq!(hms(txt.as_bytes()), want, "{txt}");
+        }}}
+        for bad in ["0a:00:00", "00-00:00", "00:00;00", "00:0/:00", "\u{0}0:00:00", "00:00:0:", " 0:00:00", "~0:00:00"] {
+            assert_eq!(hms(bad.as_bytes()), None, "{bad}");
+        }
+        for b in 0..=255u8 {
+            let mut v = *b"12:34:56";
+            for pos in 0..8 {
+                let orig = v[pos];
+                v[pos] = b;
+                let ok = std::str::from_utf8(&v).ok().and_then(|t| {
+                    let p: Vec<&str> = t.split(':').collect();
+                    if p.len() == 3 && p.iter().all(|x| x.len() == 2 && x.bytes().all(|c| c.is_ascii_digit())) {
+                        let (h, m, s) = (p[0].parse::<i64>().unwrap(), p[1].parse::<i64>().unwrap(), p[2].parse::<i64>().unwrap());
+                        (h < 24 && m < 60 && s < 60).then_some(h * 3600 + m * 60 + s)
+                    } else { None }
+                });
+                assert_eq!(hms(&v), ok, "{v:?}");
+                v[pos] = orig;
             }
         }
     }

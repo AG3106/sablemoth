@@ -4,7 +4,7 @@ mod output;
 mod ts;
 
 use hashbrown::HashMap;
-use ids::{Longs, mix, pack, pack_rec};
+use ids::{Id, Longs, mix, pack, pack_rec};
 use memmap2::Mmap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -29,8 +29,8 @@ macro_rules! log {
 /// Parsed event row (one copy). `ok` folds validation and lateness.
 #[derive(Clone, Copy)]
 struct Ev {
-    eid: u128,
-    user: u128,
+    eid: Id,
+    user: Id,
     ingest: i32, // seconds from window start (ingest_ts is always whole-second F1)
     ts: u32,     // ms from window start
     price: u32,
@@ -38,23 +38,20 @@ struct Ev {
     ok: bool,
 }
 
-/// Surviving event, keyed by person.
+/// Surviving event, keyed by person (16 bytes).
 #[derive(Clone, Copy)]
 struct SEv {
-    person: u128,
+    person: Id,
     ts: u32, // ms from window start
-    price: u32,
-    h: u32, // high bits of mix(person): sort key prefix
-    cat: u8,
+    pc: u32, // price (< 2^24, 0 unless purchase) | category << 24
 }
 
 /// Valid click.
 #[derive(Clone, Copy)]
 struct Ck {
-    cid: u128,
-    user: u128,
-    ts: i64,
-    h: u32, // high bits of mix(person), once mapped
+    cid: Id,
+    user: Id, // the person, once mapped
+    ts: i32,  // ms from window start (click window starts 7 days earlier)
     camp: u16,
 }
 
@@ -64,7 +61,7 @@ struct Ck {
 struct IdMap<T: Copy> {
     prefix: &'static [u8],
     direct: Option<Vec<Option<T>>>,
-    map: HashMap<u128, T>,
+    map: HashMap<Id, T>,
 }
 
 fn canonical_number(prefix: &[u8], id: &[u8]) -> Option<usize> {
@@ -85,7 +82,7 @@ fn canonical_number(prefix: &[u8], id: &[u8]) -> Option<usize> {
 
 impl<T: Copy> IdMap<T> {
     fn new(prefix: &'static [u8], items: &[(Vec<u8>, T)]) -> Self {
-        let map: HashMap<u128, T> = items.iter().map(|(k, v)| (pack(k), *v)).collect();
+        let map: HashMap<Id, T> = items.iter().map(|(k, v)| (pack(k), *v)).collect();
         let nums: Option<Vec<usize>> = items.iter().map(|(k, _)| canonical_number(prefix, k)).collect();
         let direct = nums.and_then(|nums| {
             let max = nums.iter().copied().max().unwrap_or(0);
@@ -132,8 +129,8 @@ struct Ctx {
 struct ParseAcc {
     ev: Vec<Vec<Ev>>,
     ck: Vec<Ck>,
-    links: Vec<(u128, u128)>,
-    longs: Vec<(u128, Box<[u8]>)>,
+    links: Vec<(Id, Id)>,
+    longs: Vec<(Id, Box<[u8]>)>,
     seps: csv::Seps,
 }
 
@@ -285,7 +282,7 @@ fn parse_click(f: [&[u8]; 4], cx: &Ctx, acc: &mut ParseAcc) {
     let Some(camp) = cx.lk.campaigns.get(camp) else { return };
     let cid = pack_rec(cid, &mut acc.longs);
     let user = pack_rec(uid, &mut acc.longs);
-    acc.ck.push(Ck { cid, user, ts: t, h: 0, camp });
+    acc.ck.push(Ck { cid, user, ts: (t - cx.ws) as i32, camp });
 }
 
 #[inline]
@@ -317,7 +314,7 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 /// slot. Key 0 marks an empty slot (no packed ID is 0).
 struct PersonMap {
     mask: usize,
-    slots: Vec<[u128; 2]>,
+    slots: Vec<[Id; 2]>,
     len: usize,
 }
 
@@ -327,10 +324,10 @@ impl PersonMap {
         PersonMap { mask: cap - 1, slots: huge_zeroed(cap), len: 0 }
     }
     #[inline(always)]
-    fn slot(&self, k: u128) -> usize {
+    fn slot(&self, k: Id) -> usize {
         (mix(k) >> 20) as usize & self.mask
     }
-    fn insert(&mut self, k: u128, v: u128) {
+    fn insert(&mut self, k: Id, v: Id) {
         let mut h = self.slot(k);
         while self.slots[h][0] != 0 {
             h = (h + 1) & self.mask;
@@ -339,7 +336,7 @@ impl PersonMap {
         self.len += 1;
     }
     #[inline(always)]
-    fn get(&self, k: u128) -> u128 {
+    fn get(&self, k: Id) -> Id {
         let mut h = self.slot(k);
         loop {
             let [key, val] = self.slots[h];
@@ -353,7 +350,7 @@ impl PersonMap {
         }
     }
     #[inline(always)]
-    fn prefetch(&self, k: u128) {
+    fn prefetch(&self, k: Id) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::*;
@@ -388,11 +385,11 @@ fn huge_zeroed<T: Copy>(n: usize) -> Vec<T> {
     }
 }
 
-fn build_persons(links: &[(u128, u128)], longs: &Longs) -> PersonMap {
-    let mut index: HashMap<u128, u32> = HashMap::with_capacity(links.len() * 2);
-    let mut ids: Vec<u128> = Vec::with_capacity(links.len() * 2);
+fn build_persons(links: &[(Id, Id)], longs: &Longs) -> PersonMap {
+    let mut index: HashMap<Id, u32> = HashMap::with_capacity(links.len() * 2);
+    let mut ids: Vec<Id> = Vec::with_capacity(links.len() * 2);
     let mut parent: Vec<u32> = Vec::with_capacity(links.len() * 2);
-    let mut get = |x: u128, ids: &mut Vec<u128>, parent: &mut Vec<u32>| -> u32 {
+    let mut get = |x: Id, ids: &mut Vec<Id>, parent: &mut Vec<u32>| -> u32 {
         *index.entry(x).or_insert_with(|| {
             ids.push(x);
             parent.push(parent.len() as u32);
@@ -408,7 +405,7 @@ fn build_persons(links: &[(u128, u128)], longs: &Longs) -> PersonMap {
         }
     }
     let n = ids.len();
-    let mut name: Vec<u128> = vec![0; n];
+    let mut name: Vec<Id> = vec![0; n];
     let mut has: Vec<bool> = vec![false; n];
     for i in 0..n {
         let r = find(&mut parent, i as u32) as usize;
@@ -426,7 +423,7 @@ fn build_persons(links: &[(u128, u128)], longs: &Longs) -> PersonMap {
 }
 
 pub struct UserRow {
-    pub person: u128,
+    pub person: Id,
     pub day: i32,
     pub sessions: u32,
     pub events: u32,
@@ -478,7 +475,7 @@ impl CampAcc {
 /// Process one person: events sorted by ts, clicks sorted by (ts asc, cid desc).
 #[allow(clippy::too_many_arguments)]
 fn process_person(
-    person: u128,
+    person: Id,
     evs: &[SEv],
     cks: &[Ck],
     ws: i64,
@@ -493,17 +490,19 @@ fn process_person(
     let mut hi = 0; // first click with ts > start
     let (mut d_sess, mut d_ev, mut d_rev, mut d_anyp) = (0u32, 0u32, 0i64, false);
     while i < evs.len() {
-        let start = ws + evs[i].ts as i64;
+        let start_rel = evs[i].ts as i64;
+        let start = ws + start_rel;
         let mut j = i;
         let mut rev = 0i64;
         let mut anyp = false;
         let mut prev = evs[i].ts;
         while j < evs.len() && evs[j].ts - prev <= GAP as u32 {
             let e = &evs[j];
-            if e.price > 0 {
-                rev += e.price as i64;
+            let price = (e.pc & 0xFF_FFFF) as i64;
+            if price > 0 {
+                rev += price;
                 anyp = true;
-                cat_rev[e.cat as usize] += e.price as i64;
+                cat_rev[(e.pc >> 24) as usize] += price;
             }
             prev = e.ts;
             j += 1;
@@ -511,10 +510,10 @@ fn process_person(
         let day = start.div_euclid(DAY);
         let di = (day - day0) as usize;
         // credit + assists
-        while hi < cks.len() && cks[hi].ts <= start {
+        while hi < cks.len() && cks[hi].ts as i64 <= start_rel {
             hi += 1;
         }
-        while lo < hi && cks[lo].ts < start - WEEK {
+        while lo < hi && (cks[lo].ts as i64) < start_rel - WEEK {
             lo += 1;
         }
         let credit = if hi > lo { cks[hi - 1].camp as usize } else { organic };
@@ -603,7 +602,7 @@ fn main() {
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
     let ws = manifest_value(&manifest, "window_start");
     let we = manifest_value(&manifest, "window_end");
-    assert!(we > ws && we - ws < 40 * DAY, "window too long for u32 offsets");
+    assert!(we > ws && we - ws < 24 * DAY, "window too long for 32-bit ms offsets");
     let mut cx = Ctx { eb: 1, ws, we, lk: load_lookups(&data) };
     let day0 = ws.div_euclid(DAY);
     // dates that can matter: click window start - 1 day .. window end + 1 day (offsets)
@@ -675,7 +674,7 @@ fn main() {
     };
     let link_accs = run_tasks(link_tasks.len(), ParseAcc::default, |a, i| parse_task(a, link_tasks[i]));
     let mut longs = Longs::default();
-    let mut links: Vec<(u128, u128)> = Vec::new();
+    let mut links: Vec<(Id, Id)> = Vec::new();
     for a in link_accs {
         longs.add_all(a.longs);
         links.extend_from_slice(&a.links);
@@ -706,8 +705,6 @@ fn main() {
     }
     let ev_in: Vec<Mutex<Vec<Vec<Ev>>>> = ev_in.into_iter().map(Mutex::new).collect();
     let persons = &persons;
-    // test hook: SS_HMASK=15 forces sort-key hash collisions
-    let hmask: u32 = env("SS_HMASK", "4294967295").parse().unwrap();
 
     // ---------- event dedup per eid bucket, scatter by person ----------
     let out_cap = est_rows / PB / nthreads + 64;
@@ -757,8 +754,7 @@ fn main() {
                 let e = &part[i];
                 if e.ok && dead[i / 64] & (1 << (i % 64)) == 0 {
                     let person = persons.get(e.user);
-                    let m = mix(person);
-                    out[(m as usize) & (PB - 1)].push(SEv { person, ts: e.ts, price: e.price, h: (m >> 32) as u32 & hmask, cat: e.cat });
+                    out[(mix(person) as usize) & (PB - 1)].push(SEv { person, ts: e.ts, pc: e.price | (e.cat as u32) << 24 });
                 }
             }
         }
@@ -777,8 +773,7 @@ fn main() {
             }
             let c = part[i];
             let person = persons.get(c.user);
-            let m = mix(person);
-            out[(m as usize) & (PB - 1)].push(Ck { user: person, h: (m >> 32) as u32 & hmask, ..c });
+            out[(mix(person) as usize) & (PB - 1)].push(Ck { user: person, ..c });
         }
     });
     let ck_buckets = transpose(ck_scattered);
@@ -793,33 +788,15 @@ fn main() {
         for p in eparts {
             evs.extend_from_slice(&p);
         }
-        // Order persons by (h, person), events by ts: sort on the u64 (h, ts), then
-        // fix up any run of equal h that mixes persons (a 32-bit hash collision).
-        evs.sort_unstable_by_key(|e| ((e.h as u64) << 32) | e.ts as u64);
-        {
-            let mut i = 0;
-            while i < evs.len() {
-                let h = evs[i].h;
-                let mut j = i + 1;
-                let mut mixed = false;
-                while j < evs.len() && evs[j].h == h {
-                    mixed |= evs[j].person != evs[i].person;
-                    j += 1;
-                }
-                if mixed {
-                    evs[i..j].sort_by_key(|e| (e.person, e.ts));
-                }
-                i = j;
-            }
-        }
+        evs.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128);
         let mut cks: Vec<Ck> = Vec::with_capacity(cparts.iter().map(|p| p.len()).sum());
         for p in cparts {
             cks.extend_from_slice(&p);
         }
         if longs_ref.is_empty() {
-            cks.sort_unstable_by(|a, b| (a.h, a.user, a.ts).cmp(&(b.h, b.user, b.ts)).then(b.cid.cmp(&a.cid)));
+            cks.sort_unstable_by(|a, b| (a.user, a.ts).cmp(&(b.user, b.ts)).then(b.cid.cmp(&a.cid)));
         } else {
-            cks.sort_unstable_by(|a, b| (a.h, a.user, a.ts).cmp(&(b.h, b.user, b.ts)).then(longs_ref.cmp(b.cid, a.cid)));
+            cks.sort_unstable_by(|a, b| (a.user, a.ts).cmp(&(b.user, b.ts)).then(longs_ref.cmp(b.cid, a.cid)));
         }
         cks.dedup_by(|a, b| a.cid == b.cid);
         let mut cat_rev = vec![0i64; ncat];
@@ -830,8 +807,7 @@ fn main() {
             while j < evs.len() && evs[j].person == p {
                 j += 1;
             }
-            let ph = evs[i].h;
-            while k < cks.len() && (cks[k].h, cks[k].user) < (ph, p) {
+            while k < cks.len() && cks[k].user < p {
                 k += 1;
             }
             let mut l = k;
