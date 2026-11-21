@@ -1,65 +1,52 @@
 //! IDs as exact u64 keys.
 //!
-//! An ID of at most 10 bytes drawn from `0-9 A-Z _ a-z` (63 symbols) is packed
-//! as 6-bit codes, big-endian from bit 63, with codes assigned in ASCII order
-//! and 0 as padding. Integer equality and order are then exactly byte-wise
-//! equality and order, and the low 4 bits are 0. Every generator ID (`e`, `u`,
-//! `k` + up to 8 base-36 chars, upper-cased variants) fits.
+//! An ID of at most 9 bytes, each in 0x01..=0x7F (non-NUL ASCII), is packed as
+//! 7-bit codes (the bytes themselves), big-endian from bit 63, zero-padded, low
+//! bit 0. Integer equality and order are then exactly byte-wise equality and
+//! order. Every generator ID (`e`, `u`, `k` + up to 8 base-36 chars, and
+//! upper-cased variants) fits. Packing is a few SWAR shifts on one 8-byte load.
 //!
-//! Any other ID (longer, or with other bytes such as spaces, `\r`, UTF-8)
-//! becomes a 60-bit xxh3 hash tagged with low nibble 0xF. Its bytes go in the
-//! `Longs` side table, which asserts on hash collisions and gives exact ordering.
-//! A packed ID and a hashed ID never compare equal (different low nibble).
+//! Any other ID (longer, NUL, or non-ASCII bytes) becomes a 63-bit xxh3 hash
+//! tagged with low bit 1. Its bytes go in the `Longs` side table, which asserts
+//! on hash collisions and gives exact ordering. A packed ID and a hashed ID
+//! never compare equal (different low bit).
 
 use hashbrown::HashMap;
 use std::cmp::Ordering;
 
 pub type Id = u64;
 
-const TAG: u64 = 0xF;
+const TAG: u64 = 1;
+const H80: u64 = 0x8080_8080_8080_8080;
+const L7F: u64 = 0x7f7f_7f7f_7f7f_7f7f;
 
-const fn code_table() -> [u8; 256] {
-    let mut t = [0u8; 256];
-    let mut code = 1u8;
-    let mut b = 0usize;
-    while b < 256 {
-        let c = b as u8;
-        if c.is_ascii_digit() || c.is_ascii_uppercase() || c == b'_' || c.is_ascii_lowercase() {
-            t[b] = code;
-            code += 1;
-        }
-        b += 1;
-    }
-    t
+/// 8 big-endian 7-bit codes (top bit of each byte clear) -> 56 bits.
+#[inline(always)]
+fn compact(y: u64) -> u64 {
+    let y = (y & 0x007f_007f_007f_007f) | ((y & 0x7f00_7f00_7f00_7f00) >> 1);
+    let y = (y & 0x0000_3fff_0000_3fff) | ((y & 0x3fff_0000_3fff_0000) >> 2);
+    (y & 0x0000_0000_0fff_ffff) | ((y & 0x0fff_ffff_0000_0000) >> 4)
 }
-static CODE: [u8; 256] = code_table();
-
-const fn decode_table() -> [u8; 64] {
-    let mut t = [0u8; 64];
-    let codes = code_table();
-    let mut b = 0usize;
-    while b < 256 {
-        if codes[b] != 0 {
-            t[codes[b] as usize] = b as u8;
-        }
-        b += 1;
-    }
-    t
-}
-static DECODE: [u8; 64] = decode_table();
 
 #[inline(always)]
 pub fn pack(b: &[u8]) -> Id {
-    if b.len() <= 10 {
-        let mut acc = 0u64;
-        let mut bad = 0u8;
-        for (i, &c) in b.iter().enumerate() {
-            let code = CODE[c as usize];
-            bad |= (code == 0) as u8;
-            acc |= (code as u64) << (58 - 6 * i);
-        }
-        if bad == 0 {
-            return acc;
+    let n = b.len();
+    if n <= 9 {
+        let (hi, last) = if n >= 8 {
+            (u64::from_be_bytes(b[..8].try_into().unwrap()), if n == 9 { b[8] } else { 0 })
+        } else {
+            let mut x = 0u64;
+            for (i, &c) in b.iter().enumerate() {
+                x |= (c as u64) << (56 - 8 * i);
+            }
+            (x, 0)
+        };
+        // high bit of each byte set iff that byte is non-zero (exact: no carries)
+        let nonzero = ((hi & L7F).wrapping_add(L7F) | hi) & H80;
+        let k = n.min(8);
+        let want = if k == 0 { 0 } else { H80 << (8 * (8 - k)) };
+        if hi & H80 == 0 && nonzero == want && last < 0x80 && (n < 9 || last != 0) {
+            return (compact(hi) << 8) | ((last as u64) << 1);
         }
     }
     hashed(b)
@@ -67,7 +54,7 @@ pub fn pack(b: &[u8]) -> Id {
 
 #[cold]
 fn hashed(b: &[u8]) -> Id {
-    (xxhash_rust::xxh3::xxh3_64(b) & !TAG) | TAG
+    xxhash_rust::xxh3::xxh3_64(b) | TAG
 }
 
 #[inline(always)]
@@ -116,12 +103,12 @@ impl Longs {
             &self.map[&x]
         } else {
             let mut n = 0;
-            while n < 10 {
-                let code = (x >> (58 - 6 * n)) & 63;
+            while n < 9 {
+                let code = ((x >> (57 - 7 * n)) & 0x7f) as u8;
                 if code == 0 {
                     break;
                 }
-                buf[n] = DECODE[code as usize];
+                buf[n] = code;
                 n += 1;
             }
             &buf[..n]
@@ -159,14 +146,27 @@ mod tests {
                 assert_eq!(ids[i] == ids[j], a == b);
             }
         }
-        // every printable short ID in the alphabet round-trips and orders exactly
-        let alpha: Vec<u8> = (0u8..=255).filter(|&c| CODE[c as usize] != 0).collect();
-        assert_eq!(alpha.len(), 63);
-        for &c1 in &alpha {
-            for &c2 in &alpha {
-                let (a, b) = ([b'u', c1], [b'u', c1, c2]);
-                assert!(pack(&a) < pack(&b));
-                assert_eq!(pack(&[c1]).cmp(&pack(&[c2])), c1.cmp(&c2));
+        // exhaustive over short ASCII IDs: round-trip, equality and order exact
+        let mut all: Vec<Vec<u8>> = vec![];
+        for c1 in [1u8, b' ', b'0', b'A', b'Z', b'_', b'a', b'z', 0x7f, 0x80, 0] {
+            all.push(vec![c1]);
+            for c2 in [1u8, b'0', b'a', 0x7f, 0x80, 0, b'\r'] {
+                all.push(vec![b'u', c1, c2]);
+                all.push(vec![b'u', b'1', b'2', b'3', b'4', b'5', b'6', c1, c2]);
+                all.push(vec![b'u', b'1', b'2', b'3', b'4', b'5', b'6', b'7', c1, c2]);
+            }
+        }
+        all.push(vec![]);
+        let mut longs = Vec::new();
+        let ids: Vec<Id> = all.iter().map(|b| pack_rec(b, &mut longs)).collect();
+        let mut t = Longs::default();
+        t.add_all(longs);
+        for (i, a) in all.iter().enumerate() {
+            let mut buf = [0u8; 16];
+            assert_eq!(t.bytes(ids[i], &mut buf), &a[..], "{a:?}");
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(t.cmp(ids[i], ids[j]), a.cmp(b), "{a:?} {b:?}");
+                assert_eq!(ids[i] == ids[j], a == b, "{a:?} {b:?}");
             }
         }
     }
