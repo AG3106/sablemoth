@@ -1,0 +1,8 @@
+/target
+/data
+/out
+/.tools
+/.venv
+/vendor
+*.zip
+__pycache__/
