@@ -26,17 +26,15 @@ macro_rules! log {
     };
 }
 
-/// Parsed event row (one copy). `ok` folds validation and lateness.
+/// One identifiable copy. A valid location indexes the owner's payload stream.
 #[derive(Clone, Copy)]
 struct Ev {
     eid: Id,
-    user: Id,
-    ingest: i32, // seconds from window start (ingest_ts is always whole-second F1)
-    ts: u32,     // ms from window start
-    price: u32,
-    cat: u8,
-    ok: bool,
+    ingest: i32,
+    location: u32,
 }
+
+const INVALID: u32 = u32::MAX;
 
 /// Surviving event, keyed by person (16 bytes).
 #[derive(Clone, Copy)]
@@ -128,6 +126,7 @@ struct Ctx {
 #[derive(Default)]
 struct ParseAcc {
     ev: Vec<Vec<Ev>>,
+    payloads: Vec<SEv>,
     ck: Vec<Ck>,
     links: Vec<(Id, Id)>,
     longs: Vec<(Id, Box<[u8]>)>,
@@ -228,7 +227,19 @@ fn valid_price(p: &[u8]) -> Option<u32> {
     if (1..=10_000_000).contains(&v) { Some(v) } else { None }
 }
 
-#[inline]
+struct EventSink<'a> {
+    cx: &'a Ctx,
+    acc: &'a mut ParseAcc,
+}
+
+impl csv::RowSink<7> for EventSink<'_> {
+    #[inline(always)]
+    fn emit(&mut self, fields: [&[u8]; 7]) {
+        parse_event(fields, self.cx, self.acc);
+    }
+}
+
+#[inline(always)]
 fn parse_event(f: [&[u8]; 7], cx: &Ctx, acc: &mut ParseAcc) {
     let [eid, uid, ts, ingest, typ, pid, price] = f;
     if eid.is_empty() {
@@ -237,7 +248,7 @@ fn parse_event(f: [&[u8]; 7], cx: &Ctx, acc: &mut ParseAcc) {
     let eid = pack_rec(eid, &mut acc.longs);
     let ingest = parse_ts(ingest).unwrap_or(i64::MAX / 2);
     let ingest_s = (ingest - cx.ws).div_euclid(1000).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-    let mut e = Ev { eid, user: 0, ingest: ingest_s, ts: 0, price: 0, cat: 0, ok: false };
+    let mut location = INVALID;
     'v: {
         if uid.is_empty() || pid.is_empty() {
             break 'v;
@@ -251,22 +262,24 @@ fn parse_event(f: [&[u8]; 7], cx: &Ctx, acc: &mut ParseAcc) {
             b"purchase" => true,
             _ => break 'v,
         };
+        let mut cents = 0;
         if purchase {
             match valid_price(price) {
-                Some(p) => e.price = p,
+                Some(p) => cents = p,
                 None => break 'v,
             }
         }
         if ingest - t > DAY {
             break 'v;
         }
-        e.ts = (t - cx.ws) as u32;
-        e.user = pack_rec(uid, &mut acc.longs);
-        e.cat = cx.lk.products.get(pid).unwrap_or(cx.lk.unknown);
-        e.ok = true;
+        let user = pack_rec(uid, &mut acc.longs);
+        let cat = if purchase { cx.lk.products.get(pid).unwrap_or(cx.lk.unknown) } else { 0 };
+        location = u32::try_from(acc.payloads.len()).expect("worker payload offset overflow");
+        assert_ne!(location, INVALID);
+        acc.payloads.push(SEv { person: user, ts: (t - cx.ws) as u32, pc: cents | (cat as u32) << 24 });
     }
     let b = (mix(eid) as usize) & (cx.eb - 1);
-    acc.ev[b].push(e);
+    acc.ev[b].push(Ev { eid, ingest: ingest_s, location });
 }
 
 #[inline]
@@ -591,6 +604,98 @@ fn transpose<T>(v: Vec<Vec<Vec<T>>>) -> Vec<Mutex<Vec<Vec<T>>>> {
     out.into_iter().map(Mutex::new).collect()
 }
 
+#[derive(Default)]
+struct Groups {
+    index: HashMap<Id, usize>,
+    counts: Vec<(usize, usize)>,
+    events: Vec<SEv>,
+    clicks: Vec<Ck>,
+    event_groups: Vec<usize>,
+    click_groups: Vec<usize>,
+}
+
+impl Groups {
+    fn process(&mut self, events: Vec<Vec<SEv>>, clicks: Vec<Vec<Ck>>, longs: &Longs,
+               mut visit: impl FnMut(Id, &[SEv], &[Ck])) {
+        self.index.clear();
+        self.counts.clear();
+        self.event_groups.clear();
+        self.click_groups.clear();
+        for e in events.iter().flatten() {
+            let group = *self.index.entry(e.person).or_insert_with(|| {
+                self.counts.push((0, 0));
+                self.counts.len() - 1
+            });
+            self.counts[group].0 += 1;
+            self.event_groups.push(group);
+        }
+        for c in clicks.iter().flatten() {
+            let group = self.index.get(&c.user).copied().unwrap_or(usize::MAX);
+            if group != usize::MAX {
+                self.counts[group].1 += 1;
+            }
+            self.click_groups.push(group);
+        }
+        // Convert counts to starting offsets. Scatter advances each offset to its slice end.
+        let (mut ne, mut nc) = (0, 0);
+        for offsets in &mut self.counts {
+            let (events, clicks) = *offsets;
+            *offsets = (ne, nc);
+            ne += events;
+            nc += clicks;
+        }
+        self.events.resize(ne, SEv { person: 0, ts: 0, pc: 0 });
+        self.clicks.resize(nc, Ck { cid: 0, user: 0, ts: 0, camp: 0 });
+        for (e, &group) in events.into_iter().flatten().zip(&self.event_groups) {
+            let pos = &mut self.counts[group].0;
+            self.events[*pos] = e;
+            *pos += 1;
+        }
+        for (c, &group) in clicks.into_iter().flatten().zip(&self.click_groups) {
+            if group != usize::MAX {
+                let pos = &mut self.counts[group].1;
+                self.clicks[*pos] = c;
+                *pos += 1;
+            }
+        }
+        let (mut e_start, mut c_start) = (0, 0);
+        for &(e_end, c_end) in &self.counts {
+            let evs = &mut self.events[e_start..e_end];
+            evs.sort_unstable_by_key(|e| e.ts);
+            let cks = &mut self.clicks[c_start..c_end];
+            if longs.is_empty() {
+                cks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then(b.cid.cmp(&a.cid)));
+            } else {
+                cks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| longs.cmp(b.cid, a.cid)));
+            }
+            let mut kept = 0;
+            for i in 0..cks.len() {
+                if kept == 0 || cks[i].cid != cks[kept - 1].cid {
+                    cks[kept] = cks[i];
+                    kept += 1;
+                }
+            }
+            visit(evs[0].person, evs, &cks[..kept]);
+            (e_start, c_start) = (e_end, c_end);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn input_is_cold(files: &[(Kind, Mmap)]) -> bool {
+    let mut sampled = 0;
+    let mut resident = 0;
+    for (_, map) in files.iter().filter(|(_, m)| m.len() >= CHUNK).step_by(3) {
+        // The base address of every mapping is page aligned.
+        let mut state = 0u8;
+        if unsafe { libc::mincore(map.as_ptr() as *mut _, 1, &mut state) } == 0 {
+            sampled += 1;
+            resident += usize::from(state & 1);
+        }
+    }
+    sampled > 0 && resident * 5 < sampled * 4
+}
+
 fn main() {
     let t0 = Instant::now();
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
@@ -658,6 +763,7 @@ fn main() {
     let per_bucket = est_rows / EB / nthreads + 64;
     let new_acc = || ParseAcc {
         ev: (0..EB).map(|_| Vec::with_capacity(per_bucket)).collect(),
+        payloads: Vec::with_capacity(est_rows / nthreads),
         ck: Vec::with_capacity(click_bytes / 40 / nthreads + 64),
         ..Default::default()
     };
@@ -666,7 +772,7 @@ fn main() {
         let d: &[u8] = m;
         let mut seps = std::mem::take(&mut acc.seps);
         match kind {
-            Kind::Events => csv::scan::<7>(d, s, e, &mut seps, |f| parse_event(f, &cx, acc)),
+            Kind::Events => csv::scan_into::<7>(d, s, e, &mut seps, EventSink { cx, acc }),
             Kind::Clicks => csv::scan::<4>(d, s, e, &mut seps, |f| parse_click(f, &cx, acc)),
             Kind::Links => csv::scan::<2>(d, s, e, &mut seps, |f| parse_link(f, acc)),
         }
@@ -681,6 +787,17 @@ fn main() {
     }
     log!(t0, "links parsed: {}", links.len());
     let (persons, longs, accs) = std::thread::scope(|sc| {
+        #[cfg(target_os = "linux")]
+        if input_is_cold(&files) {
+            sc.spawn(|| {
+                for &(file, start, end) in &other_tasks {
+                    let map = &files[file].1;
+                    for offset in (start..end).step_by(512 << 10) {
+                        let _ = map.advise_range(memmap2::Advice::WillNeed, offset, (end - offset).min(512 << 10));
+                    }
+                }
+            });
+        }
         let uf = sc.spawn(move || {
             let p = build_persons(&links, &longs);
             (p, longs)
@@ -694,13 +811,13 @@ fn main() {
 
     let mut ck_parts: Vec<Mutex<Vec<Ck>>> = Vec::new();
     let mut ev_in: Vec<Vec<Vec<Ev>>> = (0..EB).map(|_| Vec::with_capacity(accs.len())).collect();
+    let mut payloads = Vec::new();
     for a in accs {
+        payloads.push(Mutex::new(a.payloads));
         longs.add_all(a.longs);
         ck_parts.push(Mutex::new(a.ck));
         for (b, v) in a.ev.into_iter().enumerate() {
-            if !v.is_empty() {
-                ev_in[b].push(v);
-            }
+            ev_in[b].push(v);
         }
     }
     let ev_in: Vec<Mutex<Vec<Vec<Ev>>>> = ev_in.into_iter().map(Mutex::new).collect();
@@ -709,16 +826,13 @@ fn main() {
     // ---------- event dedup per eid bucket, scatter by person ----------
     let out_cap = est_rows / PB / nthreads + 64;
     let new_out = || (0..PB).map(|_| Vec::with_capacity(out_cap)).collect::<Vec<Vec<SEv>>>();
-    let ev_scattered = run_tasks(EB, new_out, |out, b| {
+    let losers = run_tasks(EB, || vec![Vec::<u32>::new(); payloads.len()], |out, b| {
         let parts = std::mem::take(&mut *ev_in[b].lock().unwrap());
         let n: usize = parts.iter().map(|p| p.len()).sum();
-        // Open addressing over (part << 32 | index) into the input parts; losing
-        // copies are marked in a per-part bitset, so survivors are read in order
-        // with no intermediate copy.
+        // Part indices identify the owners of payloads discarded during probing.
         let cap = (n * 2).next_power_of_two().max(16);
         let mask = cap - 1;
         let mut table: Vec<u64> = vec![u64::MAX; cap];
-        let mut dead: Vec<Vec<u64>> = parts.iter().map(|p| vec![0u64; p.len() / 64 + 1]).collect();
         for (pi, part) in parts.iter().enumerate() {
             for (i, e) in part.iter().enumerate() {
                 // the bucket was picked by mix's low bits; probe with its high bits
@@ -733,10 +847,12 @@ fn main() {
                     let cur = &parts[cp][ci];
                     if cur.eid == e.eid {
                         if e.ingest < cur.ingest {
-                            dead[cp][ci / 64] |= 1 << (ci % 64);
+                            if cur.location != INVALID {
+                                out[cp].push(cur.location);
+                            }
                             table[h] = ((pi as u64) << 32) | i as u64;
-                        } else {
-                            dead[pi][i / 64] |= 1 << (i % 64);
+                        } else if e.location != INVALID {
+                            out[pi].push(e.location);
                         }
                         break;
                     }
@@ -744,22 +860,33 @@ fn main() {
                 }
             }
         }
-        drop(table);
-        const AHEAD: usize = 16;
-        for (part, dead) in parts.iter().zip(&dead) {
-            for i in 0..part.len() {
-                if i + AHEAD < part.len() {
-                    persons.prefetch(part[i + AHEAD].user);
-                }
-                let e = &part[i];
-                if e.ok && dead[i / 64] & (1 << (i % 64)) == 0 {
-                    let person = persons.get(e.user);
-                    out[(mix(person) as usize) & (PB - 1)].push(SEv { person, ts: e.ts, pc: e.price | (e.cat as u32) << 24 });
-                }
-            }
-        }
     });
     drop(ev_in);
+    let losers = transpose(losers);
+    let ev_scattered = run_tasks(payloads.len(), new_out, |out, owner| {
+        let payload = std::mem::take(&mut *payloads[owner].lock().unwrap());
+        let mut bitmap = vec![0u64; payload.len().div_ceil(64)];
+        let mut expected = payload.len();
+        for locations in std::mem::take(&mut *losers[owner].lock().unwrap()) {
+            expected -= locations.len();
+            for location in locations {
+                let i = location as usize;
+                bitmap[i / 64] |= 1 << (i % 64);
+            }
+        }
+        let mut emitted = 0;
+        for (i, e) in payload.iter().enumerate() {
+            if i + 16 < payload.len() {
+                persons.prefetch(payload[i + 16].person);
+            }
+            if bitmap[i / 64] & (1 << (i % 64)) == 0 {
+                let person = persons.get(e.person);
+                out[(mix(person) as usize) & (PB - 1)].push(SEv { person, ..*e });
+                emitted += 1;
+            }
+        }
+        assert_eq!(emitted, expected);
+    });
     let ev_buckets = transpose(ev_scattered);
     log!(t0, "events deduped");
 
@@ -781,45 +908,15 @@ fn main() {
 
     // ---------- per person bucket ----------
     let longs_ref = &longs;
-    let accs = run_tasks(PB, || CampAcc::new(nc, nd), |acc, b| {
+    let accs = run_tasks(PB, || (CampAcc::new(nc, nd), Groups::default()), |(acc, groups), b| {
         let eparts = std::mem::take(&mut *ev_buckets[b].lock().unwrap());
         let cparts = std::mem::take(&mut *ck_buckets[b].lock().unwrap());
-        let mut evs: Vec<SEv> = Vec::with_capacity(eparts.iter().map(|p| p.len()).sum());
-        for p in eparts {
-            evs.extend_from_slice(&p);
-        }
-        evs.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128);
-        let mut cks: Vec<Ck> = Vec::with_capacity(cparts.iter().map(|p| p.len()).sum());
-        for p in cparts {
-            cks.extend_from_slice(&p);
-        }
-        if longs_ref.is_empty() {
-            cks.sort_unstable_by(|a, b| (a.user, a.ts).cmp(&(b.user, b.ts)).then(b.cid.cmp(&a.cid)));
-        } else {
-            cks.sort_unstable_by(|a, b| (a.user, a.ts).cmp(&(b.user, b.ts)).then(longs_ref.cmp(b.cid, a.cid)));
-        }
-        cks.dedup_by(|a, b| a.cid == b.cid);
         let mut cat_rev = vec![0i64; ncat];
-        let (mut i, mut k) = (0, 0);
-        while i < evs.len() {
-            let p = evs[i].person;
-            let mut j = i + 1;
-            while j < evs.len() && evs[j].person == p {
-                j += 1;
-            }
-            while k < cks.len() && cks[k].user < p {
-                k += 1;
-            }
-            let mut l = k;
-            while l < cks.len() && cks[l].user == p {
-                l += 1;
-            }
-            process_person(p, &evs[i..j], &cks[k..l], ws, day0, organic, &mut cat_rev, acc);
-            i = j;
-            k = l;
-        }
+        groups.process(eparts, cparts, longs_ref, |person, events, clicks| {
+            process_person(person, events, clicks, ws, day0, organic, &mut cat_rev, acc);
+        });
     });
-    let total = accs.into_iter().reduce(|a, b| a.merge(b)).unwrap();
+    let total = accs.into_iter().map(|(acc, _)| acc).reduce(|a, b| a.merge(b)).unwrap();
     log!(t0, "sessions: {} user-day rows", total.users.len());
 
     output::write(&out, &cx.lk, &longs, &total.users, day0, nd, &total.sessions, &total.purchasing, &total.revenue, &total.assisted);

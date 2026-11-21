@@ -75,20 +75,23 @@ day with a credited or assisted session.
 
 ## How it works
 
-1. **Scan**: every input file is memory-mapped and split into 4 MB chunks
-   processed in parallel. A scanner builds 64-byte SSE2 bitmasks of `,` `"`
-   `\n` and emits fields straight from the mask bits, enforcing the quoting
-   and field-count rules.
+1. **CSV scanning** distributes memory-mapped file chunks across workers. On
+   supported x86 CPUs, the event scanner finds a row's six commas and verifies
+   its quotes using AVX2 masks. Long rows and file tails use the scalar
+   splitter. Other CPUs use the existing block scanner.
 2. **IDs**: each ID becomes an exact `u64`. IDs of up to 9 ASCII bytes are
    packed as 7-bit codes, so integer order equals byte order; anything else is
    hashed, with its bytes kept in a side table for exact comparison.
 3. **People**: link pairs are merged with union-find on a side thread while
    events parse; each group is named by its smallest ID.
-4. **Dedup**: events are bucketed by event ID; each bucket keeps the earliest
-   ingested copy, then drops it if invalid.
-5. **Sessions and attribution**: survivors are bucketed by person, sorted,
-   split into sessions, credited to the latest qualifying click, and counted
-   for every assisting campaign.
+4. **Deduplication** compares event IDs and ingest times in compact buckets.
+   Each parser stores valid payloads in arrival order. Bucket workers send
+   discarded locations back to the owning parser's bitmap. A winning
+   invalid copy suppresses the event.
+5. **Sessions and attribution** group the surviving events and clicks by
+   full person ID. Prefix sums give each person a contiguous slice in worker
+   scratch space. Sorting each slice puts events and clicks in timestamp order
+   and resolves equal-time clicks by ID before session attribution.
 6. **Write**: both tables are written as uncompressed Parquet in parallel,
    then the process exits without tearing down its memory.
 
@@ -107,7 +110,10 @@ DATA_DIR=tests/fixtures/edge OUTPUT_DIR=out/rust ./target/release/sessions
 python scripts/compare.py out/ref out/rust            # exits 1 on any difference
 ```
 
-`scripts/fuzz.sh FIRST LAST [EVENTS]` runs the binary and the oracle on many
-generated datasets and compares them; `scripts/bench.sh DATA [RUNS]` times
-pinned runs. Both expect the dataset generator and Python environment in
-local, untracked directories.
+`scripts/fuzz.sh FIRST LAST [EVENTS [BINARY]]` compares generated datasets with
+the oracle and exits on errors. It uses the local generator and Python environment.
+
+`scripts/bench.sh DATA [RUNS [BINARY [NEW_RESULTS_DIR]]]` warms the input and
+runs on CPUs 0–7 with eight workers. Each trial writes its output tables and
+stage log to a fresh directory. Successful trials also save wall seconds and
+peak RSS in KiB in `time.txt`.

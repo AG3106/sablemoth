@@ -69,9 +69,21 @@ impl DateTable {
 
 static TABLE: std::sync::OnceLock<DateTable> = std::sync::OnceLock::new();
 
-/// The few calendar months around the window: the 8-byte prefix `YYYY-MM-`
-/// as a little-endian u64, the day number of the 1st, and the month length.
+#[derive(Clone, Copy, Default)]
+struct CachedDate {
+    month: u64,
+    day: [u8; 2],
+    midnight: i64,
+}
+
+#[inline(always)]
+fn day_slot(day: &[u8]) -> usize {
+    (usize::from(day[0]) * 10 + usize::from(day[1])) & 31
+}
+
+/// Exact day keys accelerate common dates. Collisions fall through to the month lookup.
 struct Months {
+    dates: [CachedDate; 32],
     n: usize,
     prefix: [u64; 8],
     base: [i64; 8],
@@ -83,12 +95,15 @@ static MONTHS: std::sync::OnceLock<Months> = std::sync::OnceLock::new();
 /// Install the fast date tables (call once, before parsing).
 pub fn init_dates(from_day: i64, to_day: i64) {
     let t = DateTable::new(from_day, to_day);
-    let mut m = Months { n: 0, prefix: [0; 8], base: [0; 8], dim: [0; 8] };
+    let mut m = Months { dates: [CachedDate::default(); 32], n: 0, prefix: [0; 8], base: [0; 8], dim: [0; 8] };
     for day in from_day..=to_day {
         let k = t.days.iter().position(|&d| d as i64 == day).unwrap() as i64 + t.first_key;
         let (y, mo) = (k / 32 / 16, k / 32 % 16);
         let text = format!("{y:04}-{mo:02}-");
         let pre = u64::from_le_bytes(text.as_bytes().try_into().unwrap());
+        let d = k % 32;
+        let digits = [b'0' + (d / 10) as u8, b'0' + (d % 10) as u8];
+        m.dates[day_slot(&digits)] = CachedDate { month: pre, day: digits, midnight: day * DAY };
         if m.prefix[..m.n].contains(&pre) || m.n == 8 {
             continue;
         }
@@ -160,10 +175,14 @@ fn slow_days(year: i64, month: i64, day: i64) -> Option<i64> {
 }
 
 /// The UTC (or local, for F2) instant of the first 19 bytes, validated.
-#[inline]
+#[inline(always)]
 fn civil_ms(v: &[u8]) -> Option<i64> {
     if let Some(m) = MONTHS.get() {
         let pre = u64::from_le_bytes(v[..8].try_into().unwrap());
+        let date = &m.dates[day_slot(&v[8..10])];
+        if date.month == pre && date.day == v[8..10] && v[10] == b'T' && pre != 0 {
+            return Some(date.midnight + hms(&v[11..19])? * SECOND);
+        }
         for k in 0..m.n {
             if m.prefix[k] == pre {
                 if v[10] != b'T' {
@@ -204,7 +223,7 @@ fn civil_ms_slow(v: &[u8]) -> Option<i64> {
     Some(days * DAY + hour * 3_600_000 + minute * MINUTE + second * SECOND)
 }
 
-#[inline]
+#[inline(always)]
 pub fn parse_ts(v: &[u8]) -> Option<i64> {
     let n = v.len();
     if n == 0 {
@@ -222,6 +241,23 @@ pub fn parse_ts(v: &[u8]) -> Option<i64> {
         }
         let off = (oh * 60 + om) * MINUTE;
         return Some(if v[19] == b'+' { local - off } else { local + off });
+    }
+    // Common epoch-millisecond width. Reduce the first eight digits in parallel.
+    if n == 13 {
+        let digits = u64::from_le_bytes(v[..8].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
+        if (digits | digits.wrapping_add(0x7676_7676_7676_7676)) & 0x8080_8080_8080_8080 != 0 {
+            return None;
+        }
+        let pairs = (digits.wrapping_mul(10) + (digits >> 8)) & 0x00ff_00ff_00ff_00ff;
+        let quads = (pairs.wrapping_mul(100) + (pairs >> 16)) & 0x0000_ffff_0000_ffff;
+        let mut value = (quads as u32 as i64) * 10_000 + (quads >> 32) as i64;
+        let mut invalid = false;
+        for &byte in &v[8..] {
+            let digit = byte.wrapping_sub(b'0');
+            invalid |= digit > 9;
+            value = value * 10 + i64::from(digit);
+        }
+        return (!invalid).then_some(value);
     }
     // F3: digits only, leading zeros allowed.
     let mut i = 0;

@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
-# usage: scripts/fuzz.sh FIRST LAST [EVENTS]   — Rust vs ref.py on generated seeds
-set -u
+# fuzz.sh FIRST LAST [EVENTS [BINARY]]
+set -euo pipefail
+binary=$(realpath "${4:-$(dirname "$0")/../target/release/sessions}")
 cd "$(dirname "$0")/.."
-GEN=vendor/generator/target/release/generate
-E=${3:-200000}; C=$((E / 4))
-W=$(mktemp -d -p "${TMPDIR:-/tmp}")
-fail=0
+gen=vendor/generator/target/release/generate
+events=${3:-200000}
+[[ $1 =~ ^[0-9]+$ && $2 =~ ^[0-9]+$ && $1 -le $2 ]]
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT
 run_seed() {
-  s=$1
-  $GEN --seed $s --events $E --clicks $C --output $W/d$s --threads 2 >/dev/null
-  .venv/bin/python -I ref/ref.py $W/d$s $W/r$s
-  DATA_DIR=$W/d$s OUTPUT_DIR=$W/o$s NCPU=4 ./target/release/sessions 2>/dev/null
-  if .venv/bin/python scripts/compare.py $W/r$s $W/o$s > $W/c$s 2>&1; then echo "seed $s OK"; else echo "seed $s MISMATCH"; cat $W/c$s; fi
-  rm -rf $W/d$s $W/r$s $W/o$s
+  local seed=$1 dir="$work/$1"
+  mkdir "$dir"
+  "$gen" --seed "$seed" --events "$events" --clicks "$((events / 4))" --output "$dir/data" --threads 2 >/dev/null
+  .venv/bin/python -I ref/ref.py "$dir/data" "$dir/ref"
+  DATA_DIR="$dir/data" OUTPUT_DIR="$dir/out" NCPU=4 "$binary"
+  .venv/bin/python scripts/compare.py "$dir/ref" "$dir/out"
+  rm -rf -- "$dir"
+  echo "seed $seed OK"
 }
-export -f run_seed; export GEN E C W
-seq $1 $2 | xargs -P 8 -I{} bash -c 'run_seed {}' | sort -V | tee $W/summary
-grep -q MISMATCH $W/summary && fail=1
-rm -rf $W
-exit $fail
+export -f run_seed
+export binary gen events work
+seq "$1" "$2" | xargs -P "${FUZZ_JOBS:-8}" -I{} bash -euc 'run_seed "$1"' _ {}
